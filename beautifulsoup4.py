@@ -104,11 +104,12 @@ else:
         if getattr(element, 'name', None) == 'table':
             # 같은 표를 두 번 읽지 않도록 방어
             if id(element) not in processed_tables:
+                
+                # 💡 핵심 방어 로직 추가: 내부에 table 태그가 또 있다면 레이아웃용 껍데기이므로 패스
+                if element.find('table'):
+                    continue
+                    
                 md_table = parse_html_table_to_markdown(element)
-                if md_table.strip():
-                    current_content.append(md_table)
-                processed_tables.add(id(element))
-            continue
 
         # 3. 일반 텍스트 처리
         if isinstance(element, NavigableString):
