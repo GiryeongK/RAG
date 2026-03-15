@@ -1,147 +1,140 @@
 import json
 import os
+import re
+import time
 from tqdm import tqdm
 from mlx_vlm import load, generate
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# 1. 앞 단계에서 만든 구조화된 JSON(마크다운 표 포함) 읽어오기
+# 1. 데이터 로드
 file_path = "report_xml_00126380_2023/parsed_business_content.json"
 print(f"1. '{file_path}' 데이터를 불러옵니다...")
-
 with open(file_path, 'r', encoding='utf-8') as f:
     parsed_sections = json.load(f)
 
-# 2. MLX 모델 로드 (M5 Pro 가속)
+# 2. MLX 모델 로드
 model_id = "mlx-community/Qwen3.5-9B-8bit"
 print(f"\n2. MLX 모델 로드 중... ({model_id})")
 model, processor = load(model_id)
 
 # ==========================================
-# 🚀 [Phase 1] 소제목별 500자 요약 (Map)
+# 🚀 [Phase 1] 표 메타데이터 핀셋 추출 & 소제목 요약 (프롬프트 완전 통제 적용)
 # ==========================================
-print("\n3. [계층형 요약 1단계] 각 소제목(목차)별 핵심 500자 요약을 시작합니다...")
+print("\n3. 표 메타데이터 추출 및 소제목 요약 (1회성 가벼운 LLM 호출) 시작...")
 section_summaries = {}
 
-for section in tqdm(parsed_sections, desc="소제목 요약 진행"):
+for section in tqdm(parsed_sections, desc="섹션 전처리"):
     section_sub = section['section_sub']
-    section_text = section['text']
-    
-    # 텍스트가 너무 짧으면 요약 생략
-    if len(section_text) < 100:
-        section_summaries[section_sub] = section_text
-        continue
+    full_text_for_summary = ""
+
+    for block in section['blocks']:
+        if block['type'] == 'text':
+            full_text_for_summary += block['content'] + "\n"
         
-    prompt = f"""당신은 금융 분석 전문가입니다. 다음은 사업보고서의 '{section_sub}' 목차 내용입니다. 
-이 내용에 등장하는 핵심 비즈니스 정보, 주요 숫자(매출, 비중 등), 전략을 500자 이내로 요약하세요.
+        elif block['type'] == 'table':
+            pre_text = block['pre_text']
+            if len(pre_text) > 10:
+                # 💡 해결 1: 괄호 및 영어 예시 완벽 제거. 철저한 단답형 요구.
+                messages = [
+                    {"role": "system", "content": "당신은 데이터 추출기입니다. 반드시 한국어로 대답하며, '표 제목:'과 '단위:' 두 줄만 출력해야 합니다. 서론이나 설명은 절대 금지합니다."},
+                    {"role": "user", "content": f"다음 텍스트에서 표의 제목과 단위를 찾아 아래 형식에 맞춰 작성하세요.\n\n[텍스트]:\n{pre_text[-500:]}\n\n[출력 형식]\n표 제목: 실제표제목\n단위: 실제단위"}
+                ]
+                prompt_table = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                
+                response = generate(model, processor, prompt=prompt_table, max_tokens=100, verbose=False)
+                clean_text = response.text.strip()
+                
+                title_match = re.search(r'표 제목:\s*(.*)', clean_text)
+                unit_match = re.search(r'단위:\s*(.*)', clean_text)
+                
+                ext_title = title_match.group(1).strip() if title_match else "제목 없음"
+                ext_unit = unit_match.group(1).strip() if unit_match else "단위 없음"
+                
+                extracted_meta = f"표 제목: {ext_title}\n단위: {ext_unit}"
+                block['assembled_table'] = f"{extracted_meta}\n{block['markdown']}"
+                
+                time.sleep(1) 
+            else:
+                block['assembled_table'] = block['markdown']
+            
+            full_text_for_summary += block['assembled_table'] + "\n"
 
-[원문]:
-{section_text[:15000]} # 메모리 초과 방지를 위해 최대 15,000자까지만 읽음
-
-요약(500자 이내):"""
-
-    response = generate(model, processor, prompt=prompt, max_tokens=500, verbose=False)
-    section_summaries[section_sub] = response.text.strip()
+    # [소제목 요약]
+    if len(full_text_for_summary) > 100:
+        # 💡 해결 2: Thinking Process 원천 차단 및 한국어 출력 강제
+        messages_sec = [
+            {"role": "system", "content": "당신은 한국인 금융 분석가입니다. 반드시 '한국어'로만 작성하십시오. 'Thinking Process', '분석' 등의 사고 과정이나 서론을 절대 출력하지 마십시오. 오직 최종 요약 결과물만 즉시 출력하십시오."},
+            {"role": "user", "content": f"아래 [원문]을 읽고 핵심 숫자와 전략을 300자 이내의 한국어로 요약하십시오.\n\n[원문]:\n{full_text_for_summary[:10000]}"}
+        ]
+        prompt_sec = processor.apply_chat_template(messages_sec, tokenize=False, add_generation_prompt=True)
+        
+        response_sec = generate(model, processor, prompt=prompt_sec, max_tokens=500, verbose=False)
+        clean_sec = response_sec.text.strip()
+        
+        # 💡 해결 3: 모델이 지시를 어기고 영어를 출력할 경우를 대비한 파이썬 강제 절단 로직
+        if "Thinking Process" in clean_sec or "Analyze" in clean_sec:
+            # 영어 분석 과정이 포함되었다면 마지막 한글 부분(실제 요약)만 강제로 추출
+            clean_sec = re.sub(r'.*?(당사는|이 부문은|이 기업은|종합하면|요약하면)', r'\1', clean_sec, flags=re.DOTALL)
+            
+        clean_sec = re.split(r'(요약\(|요약:|\[원문\])', clean_sec)[0].strip()
+        
+        section_summaries[section_sub] = clean_sec
+        time.sleep(1) 
+    else:
+        section_summaries[section_sub] = full_text_for_summary
 
 # ==========================================
-# 🚀 [Phase 2] 전체 문서 마스터 요약 (Reduce)
+# 🚀 [Phase 2] 투트랙 분할 및 최종 조립 (하드코딩 결합)
 # ==========================================
-print("\n4. [계층형 요약 2단계] 3.8만 자를 아우르는 '전체 마스터 요약본'을 생성합니다...")
-combined_summaries = "\n\n".join([f"[{k}] 요약:\n{v}" for k, v in section_summaries.items()])
+print("\n4. 투트랙(Two-Track) 청킹 및 룰베이스 최종 조립 진행...")
 
-master_prompt = f"""당신은 최고 재무 책임자(CFO)입니다. 다음은 사업보고서 각 목차별 요약본 모음입니다. 
-이 기업의 전체적인 사업 현황, 주력 제품, 리스크 및 전략을 아우르는 1000자 이내의 '전체 총괄 요약본(Master Summary)'을 작성하세요.
-
-[각 목차별 요약 모음]:
-{combined_summaries}
-
-전체 총괄 요약(1000자 이내):"""
-
-master_response = generate(model, processor, prompt=master_prompt, max_tokens=1000, verbose=False)
-master_summary = master_response.text.strip()
-print("\n[성공] 마스터 요약본이 완성되었습니다!")
-
-# ==========================================
-# 🚀 [Phase 3] 텍스트 청킹 (Chunking)
-# ==========================================
-print("\n5. 텍스트 분할(Chunking)을 시작합니다. (오버랩 200자 적용)")
 text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000, 
-    chunk_overlap=200, # 회원님 요청대로 오버랩 증가 (문맥 단절 최소화)
+    chunk_size=1500, 
+    chunk_overlap=100,
     separators=["\n\n", "\n", ". ", " ", ""]
 )
 
-all_chunks = []
+super_chunks = []
 global_chunk_idx = 0
 
 for section in parsed_sections:
     section_sub = section['section_sub']
-    chunks_in_section = text_splitter.split_text(section['text'])
+    base_meta = section['metadata'].copy()
+    base_meta.update({"section_sub": section_sub})
     
-    for text_chunk in chunks_in_section:
-        all_chunks.append({
-            "chunk_id": f"{section['metadata']['corp_code']}_{section['metadata']['report_year']}_{global_chunk_idx:04d}",
-            "section_sub": section_sub,
-            "text": text_chunk,
-            "metadata": section['metadata']
-        })
-        global_chunk_idx += 1
-
-# ==========================================
-# 🚀 [Phase 4] 문맥 주입 (Contextual Retrieval)
-# ==========================================
-super_chunks = []
-print(f"\n6. 총 {len(all_chunks)}개 청크에 [마스터 요약 + 소제목 요약 + 앞뒤 문맥]을 주입합니다...")
-
-for i, chunk_data in enumerate(tqdm(all_chunks, desc="초지능형 청크 생성")):
-    prev_id = all_chunks[i-1]['chunk_id'] if i > 0 else None
-    next_id = all_chunks[i+1]['chunk_id'] if i < len(all_chunks) - 1 else None
+    current_sec_summary = section_summaries.get(section_sub, "")
+    breadcrumb = f"[경로: {base_meta['corp_name']} > {base_meta['report_year']} 사업보고서 > {section_sub}]"
     
-    prev_text = all_chunks[i-1]['text'] if i > 0 else "문서의 시작 부분입니다."
-    next_text = all_chunks[i+1]['text'] if i < len(all_chunks) - 1 else "문서의 끝 부분입니다."
-    
-    current_text = chunk_data['text']
-    current_section = chunk_data['section_sub']
-    
-    # 회원님 아이디어의 결정체: 완벽한 프롬프트 구조
-    prompt = f"""당신은 AI 데이터 엔지니어입니다. 아래 정보를 바탕으로 [현재 청크]가 어떤 맥락을 가지는지 200자 이내로 요약하세요.
-
-[전체 문서 마스터 요약]: {master_summary}
-[현재 목차({current_section}) 핵심 요약]: {section_summaries.get(current_section, '')}
-
----
-[이전 내용]: {prev_text[-300:]} # 앞 내용의 끝부분 300자만 참조
-[현재 청크]: {current_text}
-[다음 내용]: {next_text[:300]} # 뒷 내용의 첫부분 300자만 참조
-
-청크 맥락 요약(200자 이내):"""
-
-    response = generate(model, processor, prompt=prompt, max_tokens=200, verbose=False)
-    context_summary = response.text.strip()
-    
-    # 메타데이터에 마스터 요약과 소제목 요약까지 모두 저장 (나중에 검색용으로 엄청난 위력 발휘)
-    final_metadata = chunk_data['metadata'].copy()
-    final_metadata.update({
-        "section_sub": current_section,
-        "prev_chunk_id": prev_id,
-        "next_chunk_id": next_id,
-        "master_summary": master_summary,
-        "section_summary": section_summaries.get(current_section, '')
-    })
-    
-    combined_content = f"[속한 목차]: {current_section}\n[맥락]: {context_summary}\n\n[원문]:\n{current_text}"
-    
-    super_chunks.append({
-        "chunk_id": chunk_data['chunk_id'],
-        "content": combined_content,
-        "metadata": final_metadata
-    })
+    for block in section['blocks']:
+        # 트랙 1: 일반 텍스트 분할
+        if block['type'] == 'text':
+            chunks = text_splitter.split_text(block['content'])
+            for chunk_text in chunks:
+                final_content = f"{breadcrumb}\n[섹션 핵심]: {current_sec_summary}\n\n[본문]:\n{chunk_text}"
+                super_chunks.append({
+                    "chunk_id": f"{base_meta['corp_code']}_{base_meta['report_year']}_{global_chunk_idx:04d}",
+                    "content": final_content,
+                    "metadata": base_meta
+                })
+                global_chunk_idx += 1
+                
+        # 트랙 2: 표 데이터 원본 유지
+        elif block['type'] == 'table':
+            table_content = block['assembled_table']
+            final_content = f"{breadcrumb}\n[섹션 핵심]: {current_sec_summary}\n\n[표 데이터]:\n{table_content}"
+            super_chunks.append({
+                "chunk_id": f"{base_meta['corp_code']}_{base_meta['report_year']}_{global_chunk_idx:04d}_table",
+                "content": final_content,
+                "metadata": base_meta
+            })
+            global_chunk_idx += 1
 
 # ==========================================
 # 🚀 [최종 저장]
 # ==========================================
-save_path = "report_xml_00126380_2023/samsung_super_chunks_final.json"
+save_path = "report_xml_00126380_2023/samsung_hybrid_chunks_final.json"
 with open(save_path, "w", encoding="utf-8") as f:
     json.dump(super_chunks, f, ensure_ascii=False, indent=2)
 
-print(f"\n✨ [최종 완료] '나만의 블룸버그 터미널'을 위한 초지능형 데이터셋이 완성되었습니다!")
+print(f"\n✨ [최종 완료] 무거운 LLM 연산을 덜어낸 하이브리드 청킹이 완료되었습니다!")
 print(f"저장 경로: {save_path}")
