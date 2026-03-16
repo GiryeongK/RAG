@@ -83,20 +83,18 @@ else:
         if getattr(element, 'name', None) == 'title':
             clean_title = element.text.strip()
             if clean_title:
-                # 목차가 바뀌면 남은 텍스트 버퍼를 일반 텍스트 블록으로 확정
                 if text_buffer:
                     current_blocks.append({"type": "text", "content": "\n".join(text_buffer)})
                     text_buffer = []
                 
-                # 기존 목차 데이터 저장
                 if current_blocks:
                     parsed_sections.append({
+                        "section_main": start_title.text.strip(), # 💡 추가: 중간 목차(대분류) 저장
                         "section_sub": current_section_name,
                         "blocks": current_blocks,
                         "metadata": metadata
                     })
                 
-                # 새 목차 시작
                 current_section_name = clean_title
                 current_blocks = []
             continue
@@ -150,6 +148,7 @@ else:
         current_blocks.append({"type": "text", "content": "\n".join(text_buffer)})
     if current_blocks:
         parsed_sections.append({
+            "section_main": start_title.text.strip(), # 💡 추가: 중간 목차(대분류) 저장
             "section_sub": current_section_name,
             "blocks": current_blocks,
             "metadata": metadata
