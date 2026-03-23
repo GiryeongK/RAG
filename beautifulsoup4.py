@@ -6,7 +6,11 @@ from bs4 import XMLParsedAsHTMLWarning
 
 warnings.filterwarnings('ignore', category=XMLParsedAsHTMLWarning)
 
-# 1. HTML 표를 마크다운으로 변환 (격자 복제 로직 - 유지)
+# ==============================================================================
+# [보존용 구버전 코드] HTML 표를 마크다운으로 변환 (격자 복제 로직)
+# 사유: 다중 헤더(Rowspan/Colspan) 표에서 LLM 인식 오류 및 검색 노이즈 발생으로 사용 중단
+# ==============================================================================
+'''
 def parse_html_table_to_markdown(table_tag):
     rows = table_tag.find_all('tr')
     if not rows:
@@ -44,6 +48,8 @@ def parse_html_table_to_markdown(table_tag):
             md_lines.append("|" + "|".join(["---"] * max_col) + "|")
 
     return "\n" + "\n".join(md_lines) + "\n"
+'''
+# ==============================================================================
 
 # --- 메인 파이프라인 ---
 extract_folder = "report_xml_00126380_2023" 
@@ -53,7 +59,7 @@ with open(meta_path, 'r', encoding='utf-8') as f:
     metadata = json.load(f)
 
 xml_file_path = os.path.join(extract_folder, metadata["source_file"])
-print(f"[{metadata['corp_name']}] {metadata['report_year']}년도 파싱 시작 (블록 분리 구조 적용)...")
+print(f"[{metadata['corp_name']}] {metadata['report_year']}년도 파싱 시작 (HTML 태그 원본 보존 적용)...")
 
 with open(xml_file_path, 'r', encoding='utf-8') as f:
     xml_data = f.read()
@@ -71,15 +77,14 @@ if not start_title:
 else:
     parsed_sections = []
     current_section_name = "도입부"
-    current_blocks = []  # 💡 텍스트와 표를 순서대로 담을 배열
-    text_buffer = []     # 💡 표가 나오기 전까지 텍스트를 임시로 모아두는 버퍼
+    current_blocks = []
+    text_buffer = []
     processed_tables = set()
 
     for element in start_title.next_elements:
         if getattr(element, 'name', None) == 'title' and 'III. 재무' in element.text:
             break
             
-        # 1. 소제목(목차) 처리
         if getattr(element, 'name', None) == 'title':
             clean_title = element.text.strip()
             if clean_title:
@@ -89,7 +94,7 @@ else:
                 
                 if current_blocks:
                     parsed_sections.append({
-                        "section_main": start_title.text.strip(), # 💡 추가: 중간 목차(대분류) 저장
+                        "section_main": start_title.text.strip(),
                         "section_sub": current_section_name,
                         "blocks": current_blocks,
                         "metadata": metadata
@@ -99,18 +104,14 @@ else:
                 current_blocks = []
             continue
 
-        # 2. 표(Table) 발견 시 마크다운으로 변환하여 바구니에 담기
         if getattr(element, 'name', None) == 'table':
             if id(element) not in processed_tables:
-                # 중첩 껍데기 표 무시
                 if element.find('table'):
                     continue
                 
-                # 💡 [신규 방어 로직] 레이아웃용 껍데기 표 필터링 (조건 고도화)
                 table_text = element.get_text(strip=True)
                 trs = element.find_all('tr')
                 
-                # 표의 행이 1~2줄이면서, '단위'가 포함되어 있거나 특정 기호로 시작하는 경우 껍데기로 간주
                 is_layout_table = False
                 if len(trs) <= 2:
                     if '단위' in table_text or table_text.startswith(('※', '주)', '*', '[')):
@@ -121,19 +122,18 @@ else:
                     processed_tables.add(id(element))
                     continue
                     
-                # 진짜 데이터 표만 마크다운으로 변환
-                md_table = parse_html_table_to_markdown(element)
+                # 💡 핵심 수정: 마크다운 변환 함수 제거, HTML 태그 문자열 저장
+                html_table = str(element)
                 
                 pre_table_text = "\n".join(text_buffer)
                 current_blocks.append({
                     "type": "table",
                     "pre_text": pre_table_text,
-                    "markdown": md_table
+                    "table_html": html_table  # 키 이름 table_html
                 })
                 text_buffer = []
                 processed_tables.add(id(element))
                 
-        # 3. 일반 텍스트 처리
         if isinstance(element, NavigableString):
             parent_table = element.find_parent('table')
             if parent_table and id(parent_table) in processed_tables:
@@ -143,12 +143,11 @@ else:
             if clean_str: 
                 text_buffer.append(clean_str)
 
-    # 마지막 남은 찌꺼기 처리
     if text_buffer:
         current_blocks.append({"type": "text", "content": "\n".join(text_buffer)})
     if current_blocks:
         parsed_sections.append({
-            "section_main": start_title.text.strip(), # 💡 추가: 중간 목차(대분류) 저장
+            "section_main": start_title.text.strip(),
             "section_sub": current_section_name,
             "blocks": current_blocks,
             "metadata": metadata
