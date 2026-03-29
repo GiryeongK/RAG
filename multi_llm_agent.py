@@ -183,7 +183,7 @@ if __name__ == "__main__":
     bm25_retriever.k = 20
     reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=1024, device="mps")
     
-    user_query = "24년 삼성전자 영업이익이랑 가동률은 얼마야? 원재료 값으로 나간 현금은 얼마야? 삼성전자 올해 부채는 어디서 조달한거야?"
+    user_query = "삼성전자의 2025년 매출액, 영업이익, 주당이익은 얼마야?"
     print(f"\n[사용자 질의]: {user_query}")
     print("-" * 50)
     
