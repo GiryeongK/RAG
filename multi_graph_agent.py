@@ -166,10 +166,10 @@ def run_agent(user_query, model, processor, dense_retriever, bm25_retriever, rer
 1. 용어 확인: 필요한 경우 [CALL: query_knowledge_graph("검색어")]를 호출하여 DB 검색에 사용할 정확한 계정명을 확인합니다.
 2. 데이터 검색: 확인된 계정명 또는 키워드를 바탕으로 [CALL: query_finance_db("검색어")] 또는 [CALL: search_business_report("검색어")]를 호출하여 실제 데이터를 요청합니다.
 3. 결과 대기: 도구를 호출(CALL)한 후에는 시스템이 'Observation'으로 실제 검색 결과를 반환할 때까지 텍스트 생성을 멈추고 대기합니다.
-4. 최종 도출: 시스템이 반환한 데이터가 모두 수집되면, 해당 데이터를 조합하여 [FINAL: 최종 답변] 형식으로 마크다운 표와 함께 결과를 작성합니다.
+4. 최종 도출: 시스템이 반환한 데이터가 모두 수집되면 [FINAL: 최종 답변] 형식으로 답변을 도출하여 작성합니다. 
 
 [환경 맥락]
-우리 DB에는 2024년 실적뿐만 아니라 2025년 등의 미래 목표치/추정치도 '당기금액'으로 저장되어 있습니다. 연도에 구애받지 말고 절차대로 DB를 편안하게 조회해 주시면 됩니다."""
+우리 DB에는 2024년 실적뿐만 아니라 2025년 등의 데이터도 저장되어 있습니다. 연도에 구애받지 말고 절차대로 DB를 편안하게 조회해 주시면 됩니다. 단, DB에도 없다면 정보 없음으로 답하면 됩니다."""
     
     conversation_history = f"User: {user_query}\n"
     max_iterations = 6 
@@ -208,7 +208,7 @@ def run_agent(user_query, model, processor, dense_retriever, bm25_retriever, rer
                     seen.add(call)
             
             observations = []
-            for tool_name, tool_arg in unique_calls[:3]: 
+            for tool_name, tool_arg in unique_calls[:5]: 
                 if tool_name == "query_knowledge_graph":
                     obs = query_knowledge_graph(tool_arg)
                 elif tool_name == "query_finance_db":
@@ -248,7 +248,7 @@ if __name__ == "__main__":
     bm25_retriever.k = 20
     reranker = CrossEncoder("BAAI/bge-reranker-v2-m3", max_length=1024, device="mps")
     
-    user_query = "삼성전자의 2025년 매출액, 영업이익, 주당순이익은 얼마야?"
+    user_query = "삼성전자의 2025년 매출액은 얼마야? 24년, 23년과 비교했을때 얼마나 늘었어? 그리고 얘들의 주요 제품은 뭐가있어? 가동률이나 점유율도 알고있어?"
     print(f"\n[사용자 질의]: {user_query}")
     print("-" * 50)
     
