@@ -4,6 +4,7 @@ import gc
 import torch
 import sqlite3
 import re
+import ast
 import networkx as nx
 from langchain_core.documents import Document
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -12,6 +13,9 @@ from langchain_community.retrievers import BM25Retriever
 from sentence_transformers import CrossEncoder
 from mlx_vlm import load as mlx_load, generate as mlx_generate
 import warnings
+
+# [신규 도구 임포트] 다중 기간 연산 도구
+from multi_finance_calculator import analyze_financial_trend
 
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -68,6 +72,7 @@ def query_knowledge_graph(keyword):
                     related_concepts.append(f"({node}의 {relation}) {neighbor}")
 
     if not related_concepts:
+        # 지적사항 반영: 재무 도메인으로 한정하여 원복
         return f"'{keyword}'에 대한 재무 개념 매핑 정보가 없습니다. 원래 단어로 query_finance_db를 검색해보세요."
     
     hint = "\n(안내: 이 정확한 명칭을 사용하여 query_finance_db를 호출하면 실제 재무 수치와 금액을 확인할 수 있습니다.)"
@@ -124,10 +129,15 @@ def query_finance_db(target_info, model, processor):
     except Exception as e:
         return f"SQL 오류: {e} (검색어를 더 단순하게 수정해보세요)"
 
-def search_business_report(query, dense_retriever, bm25_retriever, reranker):
-    print(f"      -> [RAG 검색 실행]: {query}")
-    d_docs = dense_retriever.invoke(query)
-    s_docs = bm25_retriever.invoke(query)
+def search_business_report(corp_name, query, vector_db, bm25_retriever, reranker):
+    print(f"      -> [RAG 검색 실행]: {corp_name} - {query}")
+    
+    # 1. Vector DB 메타데이터 동적 필터링 적용 (원천 차단)
+    d_docs = vector_db.similarity_search(query, k=15, filter={"corp_name": corp_name})
+    
+    # 2. BM25 검색 후 파이썬 레벨 필터링
+    s_docs_raw = bm25_retriever.invoke(query)
+    s_docs = [doc for doc in s_docs_raw if doc.metadata.get("corp_name") == corp_name]
     
     unique_docs = {}
     for doc in d_docs + s_docs:
@@ -137,23 +147,27 @@ def search_business_report(query, dense_retriever, bm25_retriever, reranker):
             
     combined_docs = list(unique_docs.values())
     if not combined_docs:
-        return "검색된 문서가 없습니다."
+        return f"'{corp_name}'에 대한 검색된 문서가 없습니다."
         
     cross_inp = [[query, doc.page_content] for doc in combined_docs]
     scores = reranker.predict(cross_inp)
     scored_docs = zip(combined_docs, scores)
+    
+    # 타 기업 혼입이 없으므로 토큰 최적화를 위해 top 3만 추출
     top_k_docs = [doc for doc, score in sorted(scored_docs, key=lambda x: x[1], reverse=True)[:5]]
     
-    result_str = ""
+    result_str = "다음은 검색된 사업보고서 원문입니다. 표나 수치가 있을 경우 원문 그대로를 기준으로 판단하십시오:\n\n"
     for i, doc in enumerate(top_k_docs):
-        result_str += f"[문서 {i+1}] {doc.page_content}\n"
+        meta = doc.metadata
+        source_info = f"{meta.get('report_year', '연도미상')}년 {meta.get('corp_name', '기업미상')} 사업보고서"
+        result_str += f"<doc id={i+1} source='{source_info}'>\n{doc.page_content}\n</doc>\n\n"
+        
     return result_str
 
 # ==========================================
 # 3. 에이전트 루프 (Agent Loop)
 # ==========================================
-def run_agent(user_query, model, processor, dense_retriever, bm25_retriever, reranker):
-    # 💡 역할극 제거 및 SOP(작업 표준 절차) 명문화
+def run_agent(user_query, model, processor, vector_db, bm25_retriever, reranker):
     system_prompt = """당신은 사용자의 질문을 분석하여, 사전에 구축된 하이브리드 데이터베이스(RAG 기반 텍스트 DB, SQL 기반 정형 DB)에서 정확한 정보를 추출하고 통합하는 데이터 에이전트입니다. 
 정확하고 신뢰성 있는 정보 제공을 위해, 당신의 사전 지식보다는 도구(Tool)를 통해 직접 조회된 팩트(Observation)를 우선하여 답변을 구성해 주세요.
 
@@ -161,16 +175,19 @@ def run_agent(user_query, model, processor, dense_retriever, bm25_retriever, rer
 1. query_knowledge_graph("검색어"): 일상적/추상적 재무 용어(예: 주당순이익)를 실제 DB에 저장된 공식 계정명(예: 주당이익)으로 변환해주는 매핑 도구입니다. (수치 데이터 없음)
 2. query_finance_db("검색어"): 공식 계정명을 사용하여 SQL DB에서 실제 재무 수치(당기금액)를 추출하는 도구입니다.
 3. search_business_report("검색어"): 사업보고서 내 텍스트 및 주석 정보를 검색하는 RAG 도구입니다.
+4. analyze_financial_trend("회사명", "계정명", "기간문자열"): 지정한 여러 기간의 재무 수치를 연속적으로 조회하고 증감률을 직접 계산해 반환합니다. (예: [CALL: analyze_financial_trend("삼성전자", "매출액", "2023, 2024, 2025")])
 
 [작업 표준 절차 (SOP) - 권장 진행 순서]
 1. 용어 확인: 필요한 경우 [CALL: query_knowledge_graph("검색어")]를 호출하여 DB 검색에 사용할 정확한 계정명을 확인합니다.
-2. 데이터 검색: 확인된 계정명 또는 키워드를 바탕으로 [CALL: query_finance_db("검색어")] 또는 [CALL: search_business_report("검색어")]를 호출하여 실제 데이터를 요청합니다.
+2. 데이터 검색: 확인된 계정명 또는 키워드를 바탕으로 도구를 호출합니다. (단일 수치는 query_finance_db, 텍스트 검색은 search_business_report, 연도별 증감률/비교는 analyze_financial_trend를 사용합니다.)
+※ 중요: 여러 비정형 정보를 찾아야 할 경우, 검색 정확도 하락 및 정보 누락을 막기 위해 검색어를 묶지 말고 반드시 도구를 개별적으로 나누어 호출하십시오. 
+(올바른 예: [CALL: search_business_report("삼성전자", "주요 제품")], [CALL: search_business_report("삼성전자", "가동률")] 각각 호출)
 3. 결과 대기: 도구를 호출(CALL)한 후에는 시스템이 'Observation'으로 실제 검색 결과를 반환할 때까지 텍스트 생성을 멈추고 대기합니다.
-4. 최종 도출: 시스템이 반환한 데이터가 모두 수집되면 [FINAL: 최종 답변] 형식으로 답변을 도출하여 작성합니다. 
+4. 최종 도출: 시스템이 반환한 데이터가 모두 수집되면 [FINAL] 형식으로 답변을 도출하여 1회만 작성합니다. (예: [FINAL]\n마크다운 내용...)
 
 [환경 맥락]
 우리 DB에는 2024년 실적뿐만 아니라 2025년 등의 데이터도 저장되어 있습니다. 연도에 구애받지 말고 절차대로 DB를 편안하게 조회해 주시면 됩니다. 단, DB에도 없다면 정보 없음으로 답하면 됩니다."""
-    
+
     conversation_history = f"User: {user_query}\n"
     max_iterations = 6 
     
@@ -180,7 +197,7 @@ def run_agent(user_query, model, processor, dense_retriever, bm25_retriever, rer
             {"role": "user", "content": conversation_history}
         ]
         prompt = processor.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
-        response = mlx_generate(model, processor, prompt=prompt, max_tokens=1500, temp=0.0, verbose=False)
+        response = mlx_generate(model, processor, prompt=prompt, max_tokens=2000, temp=0.0, verbose=False)
         agent_output = response.text.strip()
         
         if "Observation:" in agent_output:
@@ -188,16 +205,15 @@ def run_agent(user_query, model, processor, dense_retriever, bm25_retriever, rer
             
         print(f"\n[Agent Thought & Action]\n{agent_output}")
         
-        if "[FINAL:" in agent_output:
-            final_idx = agent_output.rfind("[FINAL:")
-            final_answer = agent_output[final_idx + 7 :].rstrip("]")
-            return final_answer.strip()
+        if "[FINAL]" in agent_output:
+            final_idx = agent_output.rfind("[FINAL]")
+            return agent_output[final_idx + 7 :].strip()
             
         elif "[CALL:" in agent_output:
-            calls = re.findall(r'\[CALL:\s*([a-zA-Z_]+)\(["\'](.*?)["\']\)\]', agent_output)
+            calls = re.findall(r'\[CALL:\s*([a-zA-Z_]+)\((.*?)\)\]', agent_output)
             
             if not calls:
-                conversation_history += f"Agent: {agent_output}\nObservation: 호출 형식이 맞지 않습니다. [CALL: 도구이름(\"검색어\")] 형식을 지켜서 다시 진행해주세요.\n"
+                conversation_history += f"Agent: {agent_output}\nObservation: 호출 형식이 맞지 않습니다. [CALL: 도구이름(\"인자\")] 형식을 지켜주세요.\n"
                 continue
             
             unique_calls = []
@@ -208,21 +224,39 @@ def run_agent(user_query, model, processor, dense_retriever, bm25_retriever, rer
                     seen.add(call)
             
             observations = []
-            for tool_name, tool_arg in unique_calls[:5]: 
+            for tool_name, tool_arg in unique_calls[:10]: 
+                arg_clean = tool_arg.strip(' "\'')
+                
                 if tool_name == "query_knowledge_graph":
-                    obs = query_knowledge_graph(tool_arg)
+                    obs = query_knowledge_graph(arg_clean)
                 elif tool_name == "query_finance_db":
-                    obs = query_finance_db(tool_arg, model, processor)
+                    obs = query_finance_db(arg_clean, model, processor)
                 elif tool_name == "search_business_report":
-                    obs = search_business_report(tool_arg, dense_retriever, bm25_retriever, reranker)
+                    try:
+                        args = ast.literal_eval(f"[{tool_arg}]")
+                        if len(args) == 2:
+                            obs = search_business_report(args[0], args[1], vector_db, bm25_retriever, reranker)
+                        else:
+                            obs = search_business_report("삼성전자", args[0], vector_db, bm25_retriever, reranker) 
+                    except Exception as e:
+                        obs = f"오류: RAG 도구 파라미터 파싱 실패 ({e})"
+                elif tool_name == "analyze_financial_trend":
+                    try:
+                        args = ast.literal_eval(f"[{tool_arg}]")
+                        if len(args) == 3:
+                            obs = analyze_financial_trend(sql_db_path, args[0], args[1], args[2])
+                        else:
+                            obs = f"오류: 전달된 인자 개수가 맞지 않습니다. 3개가 필요합니다. (현재: {len(args)}개)"
+                    except Exception as e:
+                        obs = f"오류: 파라미터 파싱 실패 ({e}) - 문자열 형식을 확인하세요."
                 else:
                     obs = f"오류: {tool_name}은(는) 없는 도구입니다."
-                observations.append(f"[{tool_name}(\"{tool_arg}\") 결과]:\n{obs}")
+                observations.append(f"[{tool_name}({tool_arg}) 결과]:\n{obs}")
                 
             combined_observation = "\n\n".join(observations)
             conversation_history += f"Agent: {agent_output}\nObservation:\n{combined_observation}\n"
         else:
-            conversation_history += f"Agent: {agent_output}\nObservation: 데이터 추출이 더 필요하면 도구를 호출하고, 수집이 완료되었으면 SOP 4단계에 따라 [FINAL: 최종 답변] 형식으로 출력하여 답변을 마무리해주세요.\n"
+            conversation_history += f"Agent: {agent_output}\nObservation: 탐색이 더 필요하면 도구를 호출하고, 완료되었으면 [FINAL] 형식으로 답변을 출력해주세요.\n"
             
     return "최대 탐색 횟수를 초과하여 답변 도출을 중단했습니다."
 
@@ -238,7 +272,6 @@ if __name__ == "__main__":
         
     embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3", model_kwargs={'device': 'mps'}, encode_kwargs={'normalize_embeddings': True})
     vector_db = Chroma(persist_directory=persist_directory, embedding_function=embeddings)
-    dense_retriever = vector_db.as_retriever(search_kwargs={"k": 20})
     
     with open(json_path, 'r', encoding='utf-8') as f:
         chunks_data = json.load(f)
@@ -252,7 +285,7 @@ if __name__ == "__main__":
     print(f"\n[사용자 질의]: {user_query}")
     print("-" * 50)
     
-    final_result = run_agent(user_query, model, processor, dense_retriever, bm25_retriever, reranker)
+    final_result = run_agent(user_query, model, processor, vector_db, bm25_retriever, reranker)
     
     print("\n==================================================")
     print("[최종 팩트 출력]")
