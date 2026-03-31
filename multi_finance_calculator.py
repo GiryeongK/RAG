@@ -4,7 +4,6 @@ def analyze_financial_trend(db_path, corp_name, account_nm, periods_str):
     periods = [p.strip() for p in periods_str.split(',')]
     print(f"      -> [다중 기간 연산 도구 실행]: {corp_name} {account_nm} ({', '.join(periods)})")
     
-    # 1. 팩트 기반: DART 표준 계정명 동의어 사전 (포괄 검색 오류 원천 차단)
     account_synonyms = {
         "매출액": ["매출액", "영업수익", "수익(매출액)"],
         "영업이익": ["영업이익", "영업이익(손실)"],
@@ -14,10 +13,7 @@ def analyze_financial_trend(db_path, corp_name, account_nm, periods_str):
         "자본총계": ["자본총계", "자본 총계"]
     }
     
-    # 에이전트가 던진 계정명(예: 매출액)을 기반으로 동의어 리스트 추출 (없으면 원래 단어 배열)
     target_accounts = account_synonyms.get(account_nm, [account_nm])
-    
-    # SQL IN 구문을 위한 플레이스홀더 생성 (예: ?, ?, ?)
     placeholders = ','.join('?' * len(target_accounts))
     
     try:
@@ -28,7 +24,6 @@ def analyze_financial_trend(db_path, corp_name, account_nm, periods_str):
         for period in periods:
             try:
                 period_val = int(period)
-                # LIKE 검색 폐기 -> IN 구문으로 정확한 일치 검색 (매출원가 혼입 방지)
                 query = f"SELECT 당기금액 FROM finance_data WHERE 회사명 = ? AND 사업연도 = ? AND 계정명 IN ({placeholders})"
                 cursor.execute(query, [corp_name, period_val] + target_accounts)
             except ValueError:
@@ -43,7 +38,6 @@ def analyze_financial_trend(db_path, corp_name, account_nm, periods_str):
                 
         conn.close()
         
-        # (이하 금액 포매팅 및 증감률 연산 로직은 기존과 동일)
         def format_money(val):
             if val is None: return "데이터 없음"
             if isinstance(val, (float, int)) and abs(val) >= 100000000:
@@ -63,11 +57,26 @@ def analyze_financial_trend(db_path, corp_name, account_nm, periods_str):
                 output_lines.append(f"- {curr_period}년: {curr_str}")
             else:
                 prev_val = results[i-1]["value"]
+                # 수학적 오류 예외 처리
                 if prev_val == 0:
-                    growth_str = "계산 불가(이전 값 0)"
-                else:
-                    rate = ((curr_val - prev_val) / prev_val) * 100
-                    growth_str = f"{rate:+.1f}%"
+                    if curr_val > 0: growth_str = "흑자전환"
+                    elif curr_val < 0: growth_str = "적자전환"
+                    else: growth_str = "변동없음(0)"
+                elif prev_val < 0:
+                    if curr_val > 0:
+                        growth_str = "흑자전환"
+                    elif curr_val < 0:
+                        rate = ((curr_val - prev_val) / abs(prev_val)) * 100
+                        growth_str = f"적자지속 ({rate:+.1f}%)"
+                    else:
+                        growth_str = "적자에서 0으로 변동"
+                else: 
+                    if curr_val < 0:
+                        growth_str = "적자전환"
+                    else:
+                        rate = ((curr_val - prev_val) / prev_val) * 100
+                        growth_str = f"{rate:+.1f}%"
+                        
                 output_lines.append(f"- {curr_period}년: {curr_str} (전기 대비 {growth_str})")
                 
         return "\n".join(output_lines)

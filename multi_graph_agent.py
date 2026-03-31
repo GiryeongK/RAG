@@ -72,7 +72,6 @@ def query_knowledge_graph(keyword):
                     related_concepts.append(f"({node}의 {relation}) {neighbor}")
 
     if not related_concepts:
-        # 지적사항 반영: 재무 도메인으로 한정하여 원복
         return f"'{keyword}'에 대한 재무 개념 매핑 정보가 없습니다. 원래 단어로 query_finance_db를 검색해보세요."
     
     hint = "\n(안내: 이 정확한 명칭을 사용하여 query_finance_db를 호출하면 실제 재무 수치와 금액을 확인할 수 있습니다.)"
@@ -99,10 +98,17 @@ def query_finance_db(target_info, model, processor):
         sql_match = re.search(r'SELECT.*?;', response.text, re.DOTALL | re.IGNORECASE)
         sql_query = sql_match.group(0).strip() if sql_match else response.text.strip()
         
+    # [수정] SQL 인젝션 및 DML(데이터 조작) 원천 차단 로직
+    forbidden_keywords = ['DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'CREATE', 'REPLACE', 'TRUNCATE']
+    if any(keyword in sql_query.upper() for keyword in forbidden_keywords):
+        return "보안 에러: 허용되지 않은 SQL 키워드가 포함되어 있습니다. (SELECT 쿼리만 실행 가능)"
+        
     print(f"      -> [SQL 자동 실행]: {sql_query.replace(chr(10), ' ')}")
     
     try:
-        conn = sqlite3.connect(sql_db_path)
+        # [수정] 읽기 전용(Read-Only) 모드로 DB 연결 강제
+        db_uri = f"file:{os.path.abspath(sql_db_path)}?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
         cursor = conn.cursor()
         cursor.execute(sql_query)
         records = cursor.fetchall()
@@ -153,8 +159,8 @@ def search_business_report(corp_name, query, vector_db, bm25_retriever, reranker
     scores = reranker.predict(cross_inp)
     scored_docs = zip(combined_docs, scores)
     
-    # 타 기업 혼입이 없으므로 토큰 최적화를 위해 top 3만 추출
-    top_k_docs = [doc for doc, score in sorted(scored_docs, key=lambda x: x[1], reverse=True)[:5]]
+    # 타 기업 혼입이 없으므로 토큰 최적화를 위해 top 5만 추출 (원본 상태 복구)
+    top_k_docs = [doc for doc, score in sorted(scored_docs, key=lambda x: x[1], reverse=True)[:8]]
     
     result_str = "다음은 검색된 사업보고서 원문입니다. 표나 수치가 있을 경우 원문 그대로를 기준으로 판단하십시오:\n\n"
     for i, doc in enumerate(top_k_docs):
@@ -183,10 +189,10 @@ def run_agent(user_query, model, processor, vector_db, bm25_retriever, reranker)
 ※ 중요: 여러 비정형 정보를 찾아야 할 경우, 검색 정확도 하락 및 정보 누락을 막기 위해 검색어를 묶지 말고 반드시 도구를 개별적으로 나누어 호출하십시오. 
 (올바른 예: [CALL: search_business_report("삼성전자", "주요 제품")], [CALL: search_business_report("삼성전자", "가동률")] 각각 호출)
 3. 결과 대기: 도구를 호출(CALL)한 후에는 시스템이 'Observation'으로 실제 검색 결과를 반환할 때까지 텍스트 생성을 멈추고 대기합니다.
-4. 최종 도출: 시스템이 반환한 데이터가 모두 수집되면 [FINAL] 형식으로 답변을 도출하여 1회만 작성합니다. (예: [FINAL]\n마크다운 내용...)
+4. 최종 도출: 시스템이 반환한 데이터가 모두 수집되면 [FINAL: 최종 답변] 형식으로 답변을 도출하여 1회만 작성합니다. (예: [FINAL]\n마크다운 내용...)
 
 [환경 맥락]
-우리 DB에는 2024년 실적뿐만 아니라 2025년 등의 데이터도 저장되어 있습니다. 연도에 구애받지 말고 절차대로 DB를 편안하게 조회해 주시면 됩니다. 단, DB에도 없다면 정보 없음으로 답하면 됩니다."""
+우리 DB에는 2024 실적뿐만 아니라 2025년 등의 데이터도 저장되어 있습니다. 연도에 구애받지 말고 절차대로 DB를 편안하게 조회해 주시면 됩니다. 단, DB에도 없다면 정보 없음으로 답하면 됩니다."""
 
     conversation_history = f"User: {user_query}\n"
     max_iterations = 6 
@@ -205,12 +211,19 @@ def run_agent(user_query, model, processor, vector_db, bm25_retriever, reranker)
             
         print(f"\n[Agent Thought & Action]\n{agent_output}")
         
-        if "[FINAL]" in agent_output:
-            final_idx = agent_output.rfind("[FINAL]")
-            return agent_output[final_idx + 7 :].strip()
+        # 1. 텍스트 분리: </think> 태그가 존재하면 그 뒷부분만 잘라내어 action_text로 지정
+        if "</think>" in agent_output:
+            action_text = agent_output.split("</think>")[-1].strip()
+        else:
+            action_text = agent_output.strip()
             
-        elif "[CALL:" in agent_output:
-            calls = re.findall(r'\[CALL:\s*([a-zA-Z_]+)\((.*?)\)\]', agent_output)
+        # 2. 모델의 '생각'이 배제된 순수 action_text에서만 명령어 검사
+        if "[FINAL]" in action_text:
+            final_idx = action_text.rfind("[FINAL]")
+            return action_text[final_idx + 7 :].strip()
+            
+        elif "[CALL:" in action_text:
+            calls = re.findall(r'\[CALL:\s*([a-zA-Z_]+)\((.*?)\)\]', action_text)
             
             if not calls:
                 conversation_history += f"Agent: {agent_output}\nObservation: 호출 형식이 맞지 않습니다. [CALL: 도구이름(\"인자\")] 형식을 지켜주세요.\n"
